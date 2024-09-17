@@ -32,7 +32,7 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
   int _steps = 0;
   int _distance = 0; // in meters
   int _calories = 0;
-  List<int> _rrIntervals = [];
+  final List<int> _rrIntervals = [];
 
   List<String> _csvFiles = [];
   File? _currentCsvFile;
@@ -40,10 +40,14 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
   final Stopwatch _stopwatch = Stopwatch();
   Timer? _stopwatchTimer;
 
+  int _lastHeartRateUpdate = 0;
+  Timer? _heartRateTimer;
+
   @override
   void initState() {
     super.initState();
     _loadCsvFiles();
+    _startHeartRateTimer();
   }
 
   @override
@@ -51,7 +55,19 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
     _connection?.cancel();
     _dataCollectionTimer?.cancel();
     _stopwatchTimer?.cancel();
+    _heartRateTimer?.cancel();
     super.dispose();
+  }
+
+  void _startHeartRateTimer() {
+    _heartRateTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (DateTime.now().millisecondsSinceEpoch - _lastHeartRateUpdate > 10000) {
+        // If we haven't received an update in 10 seconds, set heart rate to 0
+        setState(() {
+          _heartRate = 0;
+        });
+      }
+    });
   }
 
   Future<bool> _requestPermissions() async {
@@ -159,6 +175,10 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
         }
       }
       print('Services discovered and subscriptions set up');
+
+      // We're not attempting to read the heart rate characteristic anymore
+      _readStepsCharacteristic();
+      // Battery is already being read in _subscribeToBatteryCharacteristic()
     } catch (e) {
       print('Error discovering services: $e');
     }
@@ -169,9 +189,11 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
       _ble.subscribeToCharacteristic(_heartRateCharacteristic!).listen(
             (data) {
           _parseHeartRateData(data);
+          _lastHeartRateUpdate = DateTime.now().millisecondsSinceEpoch;
         },
         onError: (dynamic error) {
           print('Error subscribing to heart rate: $error');
+          // Don't attempt to read the characteristic
         },
       );
     }
@@ -187,14 +209,11 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
         setState(() {
           _heartRate = data[offset] + (data[offset + 1] << 8);
         });
-        offset += 2;
       } else if (data.length >= 2) {
         setState(() {
           _heartRate = data[offset];
         });
-        offset += 1;
       }
-
       print('Heart rate updated: $_heartRate bpm');
     }
   }
@@ -236,6 +255,21 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
         },
         onError: (dynamic error) {
           print('Error subscribing to steps: $error');
+          // Attempt to read the characteristic if subscription fails
+          _readStepsCharacteristic();
+        },
+      );
+    }
+  }
+
+  void _readStepsCharacteristic() {
+    if (_stepsCharacteristic != null) {
+      _ble.readCharacteristic(_stepsCharacteristic!).then(
+            (data) {
+          _parseStepsData(data);
+        },
+        onError: (error) {
+          print('Error reading steps: $error');
         },
       );
     }
@@ -268,6 +302,13 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
     final directory = await getTemporaryDirectory();
     _currentCsvFile = File('${directory.path}/vital_sync_${DateTime.now().millisecondsSinceEpoch}.csv');
 
+    // Write headers to the new file
+    List<List<dynamic>> headers = [
+      ['Timestamp', 'Heart Rate', 'RR Intervals', 'Battery Level', 'Steps', 'Distance', 'Calories']
+    ];
+    String csv = const ListToCsvConverter().convert(headers);
+    await _currentCsvFile!.writeAsString('$csv\n');
+
     _dataCollectionTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       _saveDataToCsv();
     });
@@ -288,21 +329,35 @@ class _VitalSyncPageState extends State<VitalSyncPage> {
   Future<void> _saveDataToCsv() async {
     if (_currentCsvFile == null) return;
 
-    List<List<dynamic>> rows = [
-      ['Timestamp', 'Heart Rate', 'RR Intervals', 'Battery Level', 'Steps', 'Distance', 'Calories'],
-      [
-        DateTime.now().toIso8601String(),
-        _heartRate,
-        _rrIntervals.join(';'),
-        _batteryLevel,
-        _steps,
-        _distance,
-        _calories
-      ],
-    ];
+    bool fileExists = await _currentCsvFile!.exists();
+
+    List<List<dynamic>> rows = [];
+
+    if (!fileExists) {
+      // If file doesn't exist, add headers
+      rows.add(['Timestamp', 'Heart Rate', 'RR Intervals', 'Battery Level', 'Steps', 'Distance', 'Calories']);
+    }
+
+    // Add data row
+    rows.add([
+      DateTime.now().toIso8601String(),
+      _heartRate,
+      _rrIntervals.isEmpty ? '' : _rrIntervals.join(';'),
+      _batteryLevel,
+      _steps,
+      _distance,
+      _calories
+    ]);
 
     String csv = const ListToCsvConverter().convert(rows);
-    await _currentCsvFile!.writeAsString(csv, mode: FileMode.append);
+
+    if (fileExists) {
+      // Append to existing file
+      await _currentCsvFile!.writeAsString('$csv\n', mode: FileMode.append);
+    } else {
+      // Write new file
+      await _currentCsvFile!.writeAsString('$csv\n');
+    }
   }
 
   Future<void> _loadCsvFiles() async {
